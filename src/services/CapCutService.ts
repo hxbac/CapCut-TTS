@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Readable } from 'node:stream';
+import { ProxyAgent, type Dispatcher } from 'undici';
 import { checkEmailRegistered } from '@/api/capcut-login/api/checkEmailRegistered';
 import { emailLogin } from '@/api/capcut-login/api/emailLogin';
 import { resolveRegion } from '@/api/capcut-login/api/resolveRegion';
@@ -54,6 +55,8 @@ import type {
   SynthesizeOptions,
 } from '@/types/capcut';
 import type { PersistedSessionState } from '@/types/capcutSession';
+import type { CapCutAccountConfig } from '@/types/capcutAccount';
+import capCutAccounts from '@/configs/accounts';
 import {
   buildSensitiveFormBody,
   createDeviceId,
@@ -89,18 +92,20 @@ const {
  * 状態を持つ本体は services に残し、通信や変換の詳細は lib utils api へ逃がしている
  */
 class CapCutService {
+  private readonly account: CapCutAccountConfig;
+
   private readonly cookieJar = new CookieJar();
 
-  private readonly sessionStorePath = path.resolve(
-    process.cwd(),
-    env.CAPCUT_SESSION_STORE_PATH
-  );
+  private readonly sessionStorePath: string;
 
   private readonly restorePromise: Promise<void>;
 
-  private deviceId = env.CAPCUT_DEVICE_ID ?? createDeviceId();
+  /** このアカウント専用の egress proxy (遅延生成) */
+  private proxyDispatcher: Dispatcher | undefined;
 
-  private tdid = env.CAPCUT_TDID ?? createTrackingId();
+  private deviceId: string;
+
+  private tdid: string;
 
   private session: CapCutSessionState | null = null;
 
@@ -110,7 +115,7 @@ class CapCutService {
 
   private speakersLoadedAt = 0;
 
-  private verifyFp = env.CAPCUT_VERIFY_FP ?? createVerifyFp();
+  private verifyFp: string;
 
   private runtimeLoginBundleConfig: CapCutLoginBundleConfig = {};
 
@@ -118,8 +123,21 @@ class CapCutService {
     sourceUrls: [],
   };
 
-  constructor() {
+  constructor(account: CapCutAccountConfig) {
+    this.account = account;
+    this.sessionStorePath = path.resolve(
+      process.cwd(),
+      account.sessionStorePath
+    );
+    this.deviceId = account.deviceId ?? createDeviceId();
+    this.tdid = account.tdid ?? createTrackingId();
+    this.verifyFp = account.verifyFp ?? createVerifyFp();
     this.restorePromise = this.restorePersistedSession();
+  }
+
+  /** ログ用のアカウント識別子 */
+  get id(): string {
+    return this.account.id;
   }
 
   /**
@@ -588,7 +606,7 @@ class CapCutService {
    * 永続化済みセッションを復元する
    */
   private async restorePersistedSession() {
-    if (env.CAPCUT_DEVICE_ID && env.CAPCUT_VERIFY_FP) {
+    if (this.account.deviceId && this.account.verifyFp) {
       return;
     }
 
@@ -605,15 +623,15 @@ class CapCutService {
         return;
       }
 
-      if (!env.CAPCUT_DEVICE_ID) {
+      if (!this.account.deviceId) {
         this.deviceId = parsed.deviceId;
       }
 
-      if (!env.CAPCUT_VERIFY_FP) {
+      if (!this.account.verifyFp) {
         this.verifyFp = parsed.verifyFp;
       }
 
-      if (!env.CAPCUT_TDID && typeof parsed.tdid === 'string' && parsed.tdid) {
+      if (!this.account.tdid && typeof parsed.tdid === 'string' && parsed.tdid) {
         this.tdid = parsed.tdid;
       }
 
@@ -690,7 +708,7 @@ class CapCutService {
    */
   private async login(): Promise<CapCutSessionState> {
     logger.info('CapCut login flow started');
-    this.verifyFp = env.CAPCUT_VERIFY_FP ?? createVerifyFp();
+    this.verifyFp = this.account.verifyFp ?? createVerifyFp();
     await this.refreshLoginBundleConfig();
     await this.resetLoginAttemptState();
 
@@ -791,7 +809,7 @@ class CapCutService {
         Accept:
           'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         'Accept-Language': env.CAPCUT_LOCALE,
-        'User-Agent': env.USER_AGENT,
+        'User-Agent': this.account.userAgent,
       },
     });
 
@@ -825,7 +843,7 @@ class CapCutService {
         headers: {
           Accept: 'application/json, text/javascript',
           'Content-Type': 'application/x-www-form-urlencoded',
-          'User-Agent': env.USER_AGENT,
+          'User-Agent': this.account.userAgent,
           appid: appId,
           did: this.deviceId,
           Origin: env.CAPCUT_WEB_URL,
@@ -837,7 +855,7 @@ class CapCutService {
         },
         body: buildSensitiveFormBody(
           {
-            email: env.CAPCUT_EMAIL,
+            email: this.account.email,
           },
           ['email']
         ),
@@ -866,7 +884,7 @@ class CapCutService {
       headers: {
         Accept: 'application/json, text/javascript',
         'Content-Type': 'application/x-www-form-urlencoded',
-        'User-Agent': env.USER_AGENT,
+        'User-Agent': this.account.userAgent,
         appid: appId,
         did: this.deviceId,
         Origin: env.CAPCUT_WEB_URL,
@@ -878,7 +896,7 @@ class CapCutService {
       body: new URLSearchParams({
         type: '2',
         hashed_id: createEmailRegionHashWithSalt(
-          env.CAPCUT_EMAIL,
+          this.account.email,
           this.runtimeLoginBundleConfig.emailHashSalt
         ),
       }).toString(),
@@ -905,7 +923,7 @@ class CapCutService {
     const headers = {
       Accept: 'application/json, text/javascript',
       'Content-Type': 'application/x-www-form-urlencoded',
-      'User-Agent': env.USER_AGENT,
+      'User-Agent': this.account.userAgent,
       appid: appId,
       did: this.deviceId,
       Origin: env.CAPCUT_WEB_URL,
@@ -916,8 +934,8 @@ class CapCutService {
     };
     const body = buildSensitiveFormBody(
       {
-        email: env.CAPCUT_EMAIL,
-        password: env.CAPCUT_PASSWORD,
+        email: this.account.email,
+        password: this.account.password,
       },
       ['email', 'password']
     );
@@ -972,7 +990,7 @@ class CapCutService {
         headers: {
           Accept: 'application/json, text/javascript',
           'Content-Type': 'application/x-www-form-urlencoded',
-          'User-Agent': env.USER_AGENT,
+          'User-Agent': this.account.userAgent,
           appid: appId,
           did: this.deviceId,
           Referer: `${env.CAPCUT_WEB_URL}/${env.CAPCUT_PAGE_LOCALE}/login`,
@@ -1077,7 +1095,7 @@ class CapCutService {
               'Content-Type': 'application/json',
               Origin: env.CAPCUT_WEB_URL,
               Referer: `${env.CAPCUT_WEB_URL}/`,
-              'User-Agent': env.USER_AGENT,
+              'User-Agent': this.account.userAgent,
               appid: appId,
               did: this.deviceId,
               'store-country-code': env.CAPCUT_STORE_COUNTRY_CODE,
@@ -1390,11 +1408,11 @@ class CapCutService {
    */
   private async fetchDirectAudio(url: string) {
     const response = await downloadAudio({
-      requester: async (requestUrl, init) => fetch(requestUrl, init),
+      requester: (requestUrl, init) => this.accountFetch(requestUrl, init),
       url,
       headers: {
         Accept: 'application/json, text/plain, */*',
-        'User-Agent': env.USER_AGENT,
+        'User-Agent': this.account.userAgent,
       },
     });
 
@@ -1458,7 +1476,7 @@ class CapCutService {
           'Content-Type': 'application/json',
           Origin: env.CAPCUT_WEB_URL,
           Referer: `${env.CAPCUT_WEB_URL}/`,
-          'User-Agent': env.USER_AGENT,
+          'User-Agent': this.account.userAgent,
           appid: appId,
           appvr: options.appVersion,
           'device-time': deviceTime,
@@ -1480,6 +1498,39 @@ class CapCutService {
   /**
    * Cookie を差し込んで fetch する共通口
    */
+  /**
+   * このアカウント専用の undici proxy dispatcher を遅延生成する
+   * proxyUrl 未設定なら undefined を返し、global fetch の既定経路を使う
+   */
+  private getProxyDispatcher(): Dispatcher | undefined {
+    if (!this.account.proxyUrl) {
+      return undefined;
+    }
+
+    if (!this.proxyDispatcher) {
+      this.proxyDispatcher = new ProxyAgent(this.account.proxyUrl);
+    }
+
+    return this.proxyDispatcher;
+  }
+
+  /**
+   * アカウント固有の proxy(IP) を差し込んで fetch する
+   * proxy 未設定時は素の fetch と同じ挙動になる
+   */
+  private accountFetch(url: string, init: RequestInit): Promise<Response> {
+    const dispatcher = this.getProxyDispatcher();
+
+    if (!dispatcher) {
+      return fetch(url, init);
+    }
+
+    // dispatcher は undici 拡張。DOM の RequestInit 型には無いため個別付与する
+    return fetch(url, { ...init, dispatcher } as RequestInit & {
+      dispatcher: Dispatcher;
+    });
+  }
+
   private async fetchWithCookies(url: string, init: RequestInit) {
     const headers = new Headers(init.headers);
     const cookieHeader = this.cookieJar.getCookieHeader(url);
@@ -1495,7 +1546,7 @@ class CapCutService {
       body: toLoggableBody(init.body),
     });
 
-    const response = await fetch(url, {
+    const response = await this.accountFetch(url, {
       ...init,
       headers,
     });
@@ -1531,7 +1582,7 @@ class CapCutService {
    * _tea_web_id が取れたときはそれを最優先する
    */
   private syncDeviceIdFromCookies() {
-    if (env.CAPCUT_DEVICE_ID) {
+    if (this.account.deviceId) {
       return;
     }
 
@@ -1635,7 +1686,170 @@ const toLoggableBody = (body: BodyInit | null | undefined) => {
   return `[${body.constructor.name}]`;
 };
 
-export const capCutService = new CapCutService();
+/**
+ * レート制限を検知したアカウントを一時的に外すためのクールダウン
+ */
+const RATE_LIMIT_COOLDOWN_MS = 60 * 1000;
+
+/**
+ * エラーがレート制限起因かを推定する
+ * HTTP 429 を最優先に、代表的な文言も best-effort で拾う
+ */
+const isRateLimitError = (error: unknown): boolean => {
+  if (error instanceof CapCutApiError && error.statusCode === 429) {
+    return true;
+  }
+
+  const message = error instanceof Error ? error.message.toLowerCase() : '';
+
+  return (
+    message.includes('429') ||
+    message.includes('rate limit') ||
+    message.includes('too many') ||
+    message.includes('frequently') ||
+    message.includes('quota')
+  );
+};
+
+/**
+ * 複数アカウント(=複数セッション)を束ねて負荷を分散するプール
+ * 各 CapCutService は独立した user-agent / proxy(IP) / session を持つため、
+ * round-robin で振り分けるだけで実質的にレート制限を分散できる
+ */
+class CapCutServicePool {
+  private readonly services: CapCutService[];
+
+  private cursor = 0;
+
+  private readonly cooldownUntil = new Map<string, number>();
+
+  constructor(accounts: CapCutAccountConfig[]) {
+    if (accounts.length === 0) {
+      throw new Error('CapCutServicePool requires at least one account');
+    }
+
+    this.services = accounts.map((account) => new CapCutService(account));
+    logger.info('CapCut account pool initialized', {
+      count: this.services.length,
+      accounts: this.services.map((service) => service.id),
+    });
+  }
+
+  get size() {
+    return this.services.length;
+  }
+
+  /**
+   * cooldown 中でないアカウントを round-robin で選ぶ
+   * 全アカウントが cooldown 中なら最も早く明けるものを返す
+   */
+  private pickService(): CapCutService {
+    const now = Date.now();
+    const count = this.services.length;
+
+    for (let i = 0; i < count; i += 1) {
+      const service = this.services[this.cursor % count];
+      this.cursor = (this.cursor + 1) % count;
+
+      if ((this.cooldownUntil.get(service.id) ?? 0) <= now) {
+        return service;
+      }
+    }
+
+    return this.services.reduce((soonest, service) =>
+      (this.cooldownUntil.get(service.id) ?? 0) <
+      (this.cooldownUntil.get(soonest.id) ?? 0)
+        ? service
+        : soonest
+    );
+  }
+
+  /**
+   * pool のいずれかのアカウントで処理を実行する
+   * レート制限を検知したら該当アカウントを cooldown させ別アカウントで再試行する
+   */
+  private async run<T>(
+    operation: (service: CapCutService) => Promise<T>
+  ): Promise<T> {
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt < this.services.length; attempt += 1) {
+      const service = this.pickService();
+
+      try {
+        return await operation(service);
+      } catch (error) {
+        lastError = error;
+
+        if (!isRateLimitError(error)) {
+          throw error;
+        }
+
+        this.cooldownUntil.set(service.id, Date.now() + RATE_LIMIT_COOLDOWN_MS);
+        logger.warn('CapCut account rate limited. Cooling down and rotating', {
+          account: service.id,
+          cooldownMs: RATE_LIMIT_COOLDOWN_MS,
+        });
+      }
+    }
+
+    throw lastError instanceof Error
+      ? lastError
+      : new Error('All CapCut accounts are currently rate limited');
+  }
+
+  synthesizeBuffer(options: SynthesizeOptions): Promise<AudioResult> {
+    return this.run((service) => service.synthesizeBuffer(options));
+  }
+
+  synthesizeStream(options: SynthesizeOptions): Promise<AudioStreamResult> {
+    return this.run((service) => service.synthesizeStream(options));
+  }
+
+  listSpeakers(): Promise<SpeakerInfo[]> {
+    return this.run((service) => service.listSpeakers());
+  }
+
+  getSpeakerPreviewAudio(speakerId: string): Promise<AudioResult> {
+    return this.run((service) => service.getSpeakerPreviewAudio(speakerId));
+  }
+
+  /**
+   * 全アカウントを並列でウォームアップする（1 つ失敗しても他は継続）
+   */
+  async warmupAll(): Promise<void> {
+    const results = await Promise.allSettled(
+      this.services.map((service) => service.warmup())
+    );
+
+    results.forEach((result, index) => {
+      if (result.status === 'rejected') {
+        logger.warn('CapCut account warmup failed', {
+          account: this.services[index].id,
+          error: result.reason,
+        });
+      }
+    });
+  }
+
+  /**
+   * 全アカウントのセッションを検証・更新する
+   */
+  async refreshAll(): Promise<void> {
+    await Promise.allSettled(
+      this.services.map((service) =>
+        service.ensureAuthenticated().catch((error) => {
+          logger.warn('Background CapCut session validation failed', {
+            account: service.id,
+            error,
+          });
+        })
+      )
+    );
+  }
+}
+
+export const capCutService = new CapCutServicePool(capCutAccounts);
 
 let sessionRefreshTimer: NodeJS.Timeout | null = null;
 
@@ -1644,7 +1858,7 @@ let sessionRefreshTimer: NodeJS.Timeout | null = null;
  */
 export const startCapCutSessionTask = async () => {
   try {
-    await capCutService.warmup();
+    await capCutService.warmupAll();
   } catch (error) {
     logger.warn(
       'Initial CapCut session warmup failed. The service will retry in the background',
@@ -1658,9 +1872,7 @@ export const startCapCutSessionTask = async () => {
 
   sessionRefreshTimer = setInterval(
     () => {
-      void capCutService.ensureAuthenticated().catch((error) => {
-        logger.warn('Background CapCut session validation failed', { error });
-      });
+      void capCutService.refreshAll();
     },
     env.SESSION_REFRESH_INTERVAL_MINUTES * 60 * 1000
   );

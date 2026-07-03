@@ -1,0 +1,18 @@
+{
+  "accounts": [
+    {
+      "id": "acc1",
+      "email": "acc1@example.com",
+      "password": "password-1",
+      "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+      "proxyUrl": "http://user:pass@proxy-host-1:8080"
+    },
+    {
+      "id": "acc2",
+      "email": "acc2@example.com",
+      "password": "password-2",
+      "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+      "proxyUrl": "http://user:pass@proxy-host-2:8080"
+    }
+  ]
+}

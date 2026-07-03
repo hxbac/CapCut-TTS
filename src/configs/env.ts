@@ -19,6 +19,10 @@ const booleanFlag = z.preprocess(
   z.enum(['true', 'false']).transform((value) => value === 'true')
 );
 
+// 空文字の env はセットされていないものとして扱う（accounts ファイル運用時に便利）
+const emptyToUndefined = (value: unknown) =>
+  typeof value === 'string' && value.trim() === '' ? undefined : value;
+
 const logLevelSchema = z
   .enum(['silly', 'trace', 'debug', 'info', 'warn', 'error', 'fatal'])
   .default('info');
@@ -42,8 +46,19 @@ const envSchema = z
       .string()
       .url()
       .default('https://login.us.capcut.com'),
-    CAPCUT_EMAIL: z.string().email('CAPCUT_EMAIL must be a valid email'),
-    CAPCUT_PASSWORD: z.string().min(1, 'CAPCUT_PASSWORD is required'),
+    // Multi-session: credentials may instead be supplied per-account via
+    // CAPCUT_ACCOUNTS_PATH. When that file is absent these env values are used
+    // as the single fallback account, so they stay optional at the schema level
+    // and are validated by the account loader.
+    CAPCUT_EMAIL: z.preprocess(
+      emptyToUndefined,
+      z.string().email('CAPCUT_EMAIL must be a valid email').optional()
+    ),
+    CAPCUT_PASSWORD: z.preprocess(
+      emptyToUndefined,
+      z.string().min(1, 'CAPCUT_PASSWORD is required').optional()
+    ),
+    CAPCUT_ACCOUNTS_PATH: z.string().min(1).default('capcut-accounts.json'),
     CAPCUT_LOCALE: z.string().min(1).default('ja-JP'),
     CAPCUT_PAGE_LOCALE: z.string().min(1).default('ja-jp'),
     CAPCUT_REGION: z.string().min(1).default('JP'),

@@ -5,7 +5,11 @@ dist/
 # env
 .env
 capcut-session.json
+capcut-session.*.json
 capcut-bundle-config.json
+
+# multi-session accounts (contains credentials + proxies)
+capcut-accounts.json
 
 # generated audio cache
 speaker-preview-temp/
